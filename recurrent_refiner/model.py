@@ -133,7 +133,7 @@ class RecurrentRefiner(nn.Module):
 
 
 class CodeRecurrentModel(nn.Module):
-    def __init__(self, config: RefinerConfig):
+    def __init__(self, config: RefinerConfig, device_index: int = 0):
         super().__init__()
         self.config = config
         print(f"Loading base model: {config.base_model_id} (4-bit={config.load_in_4bit})")
@@ -154,9 +154,10 @@ class CodeRecurrentModel(nn.Module):
             # device_map="auto" tends to be overly conservative on a single
             # small GPU and offloads part of the model to CPU/disk, which
             # bitsandbytes 4-bit doesn't support without extra flags. Pinning
-            # everything to the one GPU avoids that (standard single-GPU
-            # pattern for bnb 4-bit).
-            load_kwargs["device_map"] = {"": 0}
+            # everything to one GPU avoids that (standard pattern for bnb
+            # 4-bit). device_index lets each DDP rank pin its own copy of the
+            # frozen base to its own GPU (rank N -> cuda:N).
+            load_kwargs["device_map"] = {"": device_index}
         else:
             load_kwargs["dtype"] = torch.bfloat16
 

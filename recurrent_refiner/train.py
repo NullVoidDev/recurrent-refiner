@@ -7,7 +7,11 @@ available (Kaggle, Lightning AI Studio, Colab, ...) - pass --hub_repo_id to
 checkpoint through a private HuggingFace Hub repo so any platform can resume
 where the last one left off.
 
-python -m recurrent_refiner.train --base_model Qwen/Qwen2.5-Coder-7B-Instruct
+Single GPU:
+    python -m recurrent_refiner.train --base_model Qwen/Qwen2.5-Coder-7B-Instruct
+
+Multi-GPU (data-parallel across all local GPUs, e.g. Kaggle's 2xT4):
+    torchrun --standalone --nproc_per_node=2 -m recurrent_refiner.train ...
 """
 import argparse
 import dataclasses
@@ -15,12 +19,34 @@ import math
 import os
 import random
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from .config import RefinerConfig
 from .model import CodeRecurrentModel
+
+
+def setup_distributed():
+    """No-op (rank 0, world size 1) unless launched via torchrun, which sets
+    these env vars. Lets the exact same script run single-GPU (plain python)
+    or multi-GPU (torchrun) without a separate code path."""
+    if "LOCAL_RANK" not in os.environ:
+        return 0, 0, 1, False
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return dist.get_rank(), local_rank, dist.get_world_size(), True
+
+
+def unwrap(module):
+    """DDP wraps the module and only proxies forward/parameters/train/eval -
+    custom methods (get_spectral_radius) and state_dict save/load need the
+    real module underneath."""
+    return module.module if isinstance(module, DDP) else module
 
 
 # Small, diverse Python corpus that always works offline (no dataset download,
@@ -185,9 +211,9 @@ def build_checkpoint(model, extra=None):
     every checkpoint (as v2 originally did) wastes disk and Hub bandwidth
     for no benefit, since a fresh load already gets it straight from the
     base model."""
-    ckpt = {"refiner": model.refiner.state_dict()}
+    ckpt = {"refiner": unwrap(model.refiner).state_dict()}
     if not model._use_base_head:
-        ckpt["lm_head"] = model.lm_head.state_dict()
+        ckpt["lm_head"] = unwrap(model.lm_head).state_dict()
     if extra:
         ckpt.update(extra)
     return ckpt
@@ -240,13 +266,17 @@ def main():
                               "used as a checkpoint bus across training platforms.")
     args = parser.parse_args()
 
+    rank, local_rank, world_size, is_distributed = setup_distributed()
+    is_main = (rank == 0)
+
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     tokenizer.model_max_length = args.max_seq_len
 
-    print("Loading model...")
+    if is_main:
+        print("Loading model...")
     cfg = RefinerConfig(
         base_model_id=args.base_model,
         load_in_4bit=not args.no_4bit,
@@ -257,12 +287,18 @@ def main():
         moe_aux_loss_weight=args.moe_aux_weight,
         act_loop_penalty=args.act_loop_penalty,
     )
-    model = CodeRecurrentModel(cfg)
-    trainable = model.get_trainable_params()
-    print(f"Trainable parameters: {trainable:,}")
+    # Each rank loads its own frozen 4-bit copy of the base model pinned to
+    # its own GPU (rank N -> cuda:N); only the small trainable refiner gets
+    # DDP-wrapped for gradient sync across ranks.
+    model = CodeRecurrentModel(cfg, device_index=local_rank)
+    if is_main:
+        print(f"Trainable parameters: {model.get_trainable_params():,}")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Every rank independently attempts to resume - harmless if redundant,
+    # since DDP broadcasts rank 0's weights to everyone at wrap time below
+    # regardless of what each rank ended up loading here.
     resume_path = args.resume or pull_checkpoint_from_hub(args.hub_repo_id, args.output_dir)
     if resume_path:
         try:
@@ -270,9 +306,20 @@ def main():
             model.refiner.load_state_dict(ckpt["refiner"])
             if "lm_head" in ckpt:
                 model.lm_head.load_state_dict(ckpt["lm_head"])
-            print(f"Resumed from {resume_path}")
+            if is_main:
+                print(f"Resumed from {resume_path}")
         except Exception as e:
-            print(f"[WARN] failed to load checkpoint '{resume_path}' ({e}); starting fresh instead")
+            if is_main:
+                print(f"[WARN] failed to load checkpoint '{resume_path}' ({e}); starting fresh instead")
+
+    if is_distributed:
+        # find_unused_parameters=True is required here: the MoE FFN skips
+        # calling an expert's forward entirely when no token in the batch
+        # routes to it, so not every parameter gets a gradient every step -
+        # without this flag DDP hard-errors on the first such backward pass.
+        model.refiner = DDP(model.refiner, device_ids=[local_rank], find_unused_parameters=True)
+        if not model._use_base_head:
+            model.lm_head = DDP(model.lm_head, device_ids=[local_rank], find_unused_parameters=True)
 
     samples = load_code_samples(args.dataset)
 
@@ -285,14 +332,20 @@ def main():
 
     train_samples = [samples[i] for i in train_indices]
     val_samples = [samples[i] for i in val_indices]
-    print(f"Dataset: {len(train_samples)} train / {len(val_samples)} val samples")
+    if is_main:
+        print(f"Dataset: {len(train_samples)} train / {len(val_samples)} val samples")
 
     collator = CodeCompletionCollator(tokenizer, args.max_seq_len)
     train_ds = CodeDataset(train_samples)
-    loader = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator, shuffle=True)
+    train_sampler = None
+    if is_distributed:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        loader = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator, sampler=train_sampler)
+    else:
+        loader = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator, shuffle=True)
 
     val_loader = None
-    if val_samples:
+    if val_samples and is_main:
         val_ds = CodeDataset(val_samples)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collator, shuffle=False)
 
@@ -304,15 +357,19 @@ def main():
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
 
     step = 0
+    epoch = 0
     ema_loss = None
     best_loss = float("inf")
     last_val_loss = None
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
     data_iter = iter(loader)
 
     torch.cuda.empty_cache()
 
-    print(f"Starting training for {total_steps} optimizer steps "
-          f"({args.grad_accum_steps} examples/step)...")
+    if is_main:
+        print(f"Starting training for {total_steps} optimizer steps "
+              f"({args.grad_accum_steps} examples/step/rank, world_size={world_size})...")
     device = next(model.base.parameters()).device
     while step < total_steps:
         ce_sum = moe_sum = act_sum = 0.0
@@ -321,6 +378,9 @@ def main():
             try:
                 batch = next(data_iter)
             except StopIteration:
+                epoch += 1
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
                 data_iter = iter(loader)
                 batch = next(data_iter)
 
@@ -351,20 +411,21 @@ def main():
 
         ema_loss = ce_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * ce_loss
         ppl = math.exp(ce_loss)
-        sr = model.refiner.get_spectral_radius()
 
-        print(
-            f"Step {step:>4d}/{total_steps} | "
-            f"Loss {ce_loss:.4f} (EMA {ema_loss:.4f}) | MoE-aux {moe_aux_loss:.4f} | "
-            f"Depth {act_ponder_loss:.2f}/{args.max_loop_iters} | PPL {ppl:.2f} | "
-            f"rho(A) {sr:.4f} | Tok {n_tokens}"
-        )
+        if is_main:
+            sr = unwrap(model.refiner).get_spectral_radius()
+            print(
+                f"Step {step:>4d}/{total_steps} | "
+                f"Loss {ce_loss:.4f} (EMA {ema_loss:.4f}) | MoE-aux {moe_aux_loss:.4f} | "
+                f"Depth {act_ponder_loss:.2f}/{args.max_loop_iters} | PPL {ppl:.2f} | "
+                f"rho(A) {sr:.4f} | Tok {n_tokens}"
+            )
 
         if step % args.eval_every == 0 and step > 0 and val_loader is not None:
             last_val_loss = evaluate(model, val_loader)
             print(f"  [eval] step {step} | val_loss {last_val_loss:.4f} | val_ppl {math.exp(last_val_loss):.2f}")
 
-        if step % args.save_every == 0 and step > 0:
+        if is_main and step % args.save_every == 0 and step > 0:
             ckpt = build_checkpoint(model, extra={
                 "optimizer": optimizer.state_dict(),
                 "step": step,
@@ -384,14 +445,19 @@ def main():
 
         step += 1
 
-    final_path = f"{args.output_dir}/final.pt"
-    # Store a plain dict, not the RefinerConfig instance itself: torch.load
-    # defaults to weights_only=True since PyTorch 2.6, which refuses to
-    # unpickle custom classes. Checkpoints should only ever contain
-    # tensors/primitives so they stay loadable regardless of torch version.
-    torch.save(build_checkpoint(model, extra={"config": dataclasses.asdict(cfg)}), final_path)
-    push_checkpoint_to_hub(args.hub_repo_id, final_path)
-    print("Done!")
+    if is_main:
+        final_path = f"{args.output_dir}/final.pt"
+        # Store a plain dict, not the RefinerConfig instance itself: torch.load
+        # defaults to weights_only=True since PyTorch 2.6, which refuses to
+        # unpickle custom classes. Checkpoints should only ever contain
+        # tensors/primitives so they stay loadable regardless of torch version.
+        torch.save(build_checkpoint(model, extra={"config": dataclasses.asdict(cfg)}), final_path)
+        push_checkpoint_to_hub(args.hub_repo_id, final_path)
+        print("Done!")
+
+    if is_distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
