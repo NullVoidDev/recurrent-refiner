@@ -206,9 +206,9 @@ def main():
     parser.add_argument("--base_model", default="Qwen/Qwen2.5-Coder-7B-Instruct")
     parser.add_argument("--no_4bit", action="store_true",
                          help="Disable 4-bit quantization (needs a lot more VRAM).")
-    parser.add_argument("--dataset", default="mbpp",
-                         help="HF dataset name for training text. Falls back to the "
-                              "built-in offline samples if it can't be loaded.")
+    parser.add_argument("--dataset", default="google-research-datasets/mbpp",
+                         help="HF dataset name for training text (374 examples). Falls "
+                              "back to the built-in offline samples if it can't be loaded.")
     parser.add_argument("--val_frac", type=float, default=0.15)
     parser.add_argument("--eval_every", type=int, default=100)
     parser.add_argument("--moe_aux_weight", type=float, default=0.01)
