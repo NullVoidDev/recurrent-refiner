@@ -10,6 +10,7 @@ where the last one left off.
 python -m recurrent_refiner.train --base_model Qwen/Qwen2.5-Coder-7B-Instruct
 """
 import argparse
+import dataclasses
 import math
 import os
 import random
@@ -264,11 +265,14 @@ def main():
 
     resume_path = args.resume or pull_checkpoint_from_hub(args.hub_repo_id, args.output_dir)
     if resume_path:
-        ckpt = torch.load(resume_path, map_location="cpu")
-        model.refiner.load_state_dict(ckpt["refiner"])
-        if "lm_head" in ckpt:
-            model.lm_head.load_state_dict(ckpt["lm_head"])
-        print(f"Resumed from {resume_path}")
+        try:
+            ckpt = torch.load(resume_path, map_location="cpu")
+            model.refiner.load_state_dict(ckpt["refiner"])
+            if "lm_head" in ckpt:
+                model.lm_head.load_state_dict(ckpt["lm_head"])
+            print(f"Resumed from {resume_path}")
+        except Exception as e:
+            print(f"[WARN] failed to load checkpoint '{resume_path}' ({e}); starting fresh instead")
 
     samples = load_code_samples(args.dataset)
 
@@ -381,7 +385,11 @@ def main():
         step += 1
 
     final_path = f"{args.output_dir}/final.pt"
-    torch.save(build_checkpoint(model, extra={"config": cfg}), final_path)
+    # Store a plain dict, not the RefinerConfig instance itself: torch.load
+    # defaults to weights_only=True since PyTorch 2.6, which refuses to
+    # unpickle custom classes. Checkpoints should only ever contain
+    # tensors/primitives so they stay loadable regardless of torch version.
+    torch.save(build_checkpoint(model, extra={"config": dataclasses.asdict(cfg)}), final_path)
     push_checkpoint_to_hub(args.hub_repo_id, final_path)
     print("Done!")
 
