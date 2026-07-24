@@ -140,13 +140,23 @@ class CodeRecurrentModel(nn.Module):
 
         load_kwargs = dict(trust_remote_code=True)
         if config.load_in_4bit:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "load_in_4bit=True requires a CUDA GPU (bitsandbytes 4-bit has no "
+                    "CPU kernel). Set load_in_4bit=False for CPU-only runs."
+                )
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
-            load_kwargs["device_map"] = "auto"
+            # device_map="auto" tends to be overly conservative on a single
+            # small GPU and offloads part of the model to CPU/disk, which
+            # bitsandbytes 4-bit doesn't support without extra flags. Pinning
+            # everything to the one GPU avoids that (standard single-GPU
+            # pattern for bnb 4-bit).
+            load_kwargs["device_map"] = {"": 0}
         else:
             load_kwargs["dtype"] = torch.bfloat16
 
