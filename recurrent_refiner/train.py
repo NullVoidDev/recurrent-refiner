@@ -94,8 +94,9 @@ class CodeDataset:
         return self.samples[idx % len(self.samples)]
 
 
-def train_step(model, input_ids, attention_mask, optimizer, scheduler,
-               moe_aux_weight: float, act_loop_penalty: float):
+def compute_loss_and_backward(model, input_ids, attention_mask,
+                               moe_aux_weight: float, act_loop_penalty: float,
+                               grad_accum_steps: int):
     model.refiner.train()
     if not model._use_base_head:
         model.lm_head.train()
@@ -113,14 +114,7 @@ def train_step(model, input_ids, attention_mask, optimizer, scheduler,
         ignore_index=-100,
     )
     loss = ce_loss + moe_aux_weight * moe_aux_loss + act_loop_penalty * act_ponder_loss
-
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(
-        (p for p in model.parameters() if p.requires_grad), 1.0
-    )
-    optimizer.step()
-    scheduler.step()
-    optimizer.zero_grad()
+    (loss / grad_accum_steps).backward()
 
     n_tokens = shift_mask.sum().item()
     return ce_loss.item(), moe_aux_loss.item(), act_ponder_loss.item(), n_tokens
@@ -184,6 +178,20 @@ def pull_checkpoint_from_hub(hub_repo_id, local_dir):
         return None
 
 
+def build_checkpoint(model, extra=None):
+    """lm_head is only worth saving when it's NOT the frozen base model's own
+    head - saving/uploading a borrowed, never-trained 545M-param head on
+    every checkpoint (as v2 originally did) wastes disk and Hub bandwidth
+    for no benefit, since a fresh load already gets it straight from the
+    base model."""
+    ckpt = {"refiner": model.refiner.state_dict()}
+    if not model._use_base_head:
+        ckpt["lm_head"] = model.lm_head.state_dict()
+    if extra:
+        ckpt.update(extra)
+    return ckpt
+
+
 def push_checkpoint_to_hub(hub_repo_id, local_path):
     if not hub_repo_id:
         return
@@ -216,7 +224,11 @@ def main():
     parser.add_argument("--max_loop_iters", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=2000)
+    parser.add_argument("--grad_accum_steps", type=int, default=4,
+                         help="Micro-batches accumulated per optimizer step. Each logged "
+                              "'step' below is one optimizer update, i.e. this many examples.")
+    parser.add_argument("--max_steps", type=int, default=2000,
+                         help="Number of optimizer steps (each = grad_accum_steps examples).")
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--output_dir", default="./refiner_checkpoints")
@@ -254,7 +266,8 @@ def main():
     if resume_path:
         ckpt = torch.load(resume_path, map_location="cpu")
         model.refiner.load_state_dict(ckpt["refiner"])
-        model.lm_head.load_state_dict(ckpt["lm_head"])
+        if "lm_head" in ckpt:
+            model.lm_head.load_state_dict(ckpt["lm_head"])
         print(f"Resumed from {resume_path}")
 
     samples = load_code_samples(args.dataset)
@@ -294,23 +307,44 @@ def main():
 
     torch.cuda.empty_cache()
 
-    print(f"Starting training for {total_steps} steps...")
+    print(f"Starting training for {total_steps} optimizer steps "
+          f"({args.grad_accum_steps} examples/step)...")
+    device = next(model.base.parameters()).device
     while step < total_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            continue
+        ce_sum = moe_sum = act_sum = 0.0
+        tok_sum = 0
+        for _ in range(args.grad_accum_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                batch = next(data_iter)
 
-        input_ids, attention_mask = batch
-        device = next(model.base.parameters()).device
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
+            input_ids, attention_mask = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
 
-        ce_loss, moe_aux_loss, act_ponder_loss, n_tokens = train_step(
-            model, input_ids, attention_mask, optimizer, scheduler,
-            args.moe_aux_weight, args.act_loop_penalty,
+            ce, moe, act, tok = compute_loss_and_backward(
+                model, input_ids, attention_mask,
+                args.moe_aux_weight, args.act_loop_penalty, args.grad_accum_steps,
+            )
+            ce_sum += ce
+            moe_sum += moe
+            act_sum += act
+            tok_sum += tok
+
+        torch.nn.utils.clip_grad_norm_(
+            (p for p in model.parameters() if p.requires_grad), 1.0
         )
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        ce_loss = ce_sum / args.grad_accum_steps
+        moe_aux_loss = moe_sum / args.grad_accum_steps
+        act_ponder_loss = act_sum / args.grad_accum_steps
+        n_tokens = tok_sum
+
         ema_loss = ce_loss if ema_loss is None else 0.98 * ema_loss + 0.02 * ce_loss
         ppl = math.exp(ce_loss)
         sr = model.refiner.get_spectral_radius()
@@ -327,13 +361,11 @@ def main():
             print(f"  [eval] step {step} | val_loss {last_val_loss:.4f} | val_ppl {math.exp(last_val_loss):.2f}")
 
         if step % args.save_every == 0 and step > 0:
-            ckpt = {
-                "refiner": model.refiner.state_dict(),
-                "lm_head": model.lm_head.state_dict(),
+            ckpt = build_checkpoint(model, extra={
                 "optimizer": optimizer.state_dict(),
                 "step": step,
                 "loss": ce_loss,
-            }
+            })
             path = f"{args.output_dir}/step_{step}.pt"
             torch.save(ckpt, path)
             print(f"Saved {path}")
@@ -349,10 +381,7 @@ def main():
         step += 1
 
     final_path = f"{args.output_dir}/final.pt"
-    torch.save(
-        {"refiner": model.refiner.state_dict(), "lm_head": model.lm_head.state_dict(), "config": cfg},
-        final_path,
-    )
+    torch.save(build_checkpoint(model, extra={"config": cfg}), final_path)
     push_checkpoint_to_hub(args.hub_repo_id, final_path)
     print("Done!")
 
